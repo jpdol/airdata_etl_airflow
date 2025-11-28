@@ -1,0 +1,7 @@
+db.cfg
+airflow.cfg
+logs/
+plugins/
+simple_auth_manager_passwords.json.generated
+*__pycache__
+logs
