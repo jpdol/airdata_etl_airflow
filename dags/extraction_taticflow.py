@@ -73,7 +73,7 @@ def taticflow_extraction():
 		# Verifica se há dados na tabela
 		if last_date is None:
 			# Pega a variável global
-			initial_date_str = Variable.get('initial-date')
+			initial_date_str = Variable.get('initial_date')
 
 			print(f"Nenhum dado encontrado — iniciando no dia da variavel global ({initial_date_str})")
 			return initial_date_str
