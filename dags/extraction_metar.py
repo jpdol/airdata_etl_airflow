@@ -197,7 +197,7 @@ def metar_extraction():
 
 
     # Pega a variável global
-    initial_date_str = Variable.get('initial-date')
+    initial_date_str = Variable.get('initial_date')
     ano, mes, dia = initial_date_str.split('-')
     start_date = date(day=dia, month=mes, year=ano)
     end_date = date.today()
