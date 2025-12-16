@@ -1,5 +1,6 @@
 from airflow.sdk import dag, task
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
+from airflow.models import Variable
 
 def parse_datetime(x):
 	"""Realiza o parsing de uma string para datetime no formato dd/mm/YYYY HH:MM"""
@@ -76,8 +77,10 @@ def vra_extraction():
 
 		# Verifica se há dados na tabela
 		if last_date is None:
-			print("Nenhum dado encontrado — iniciando de 2025-07-31")
-			return "2025-07-31"
+			# Pega a variável global
+			initial_date_str = Variable.get('initial-date')
+			print(f"Nenhum dado encontrado — iniciando na data da variavel global ({initial_date_str})")
+			return initial_date_str
 		date_str = last_date.strftime("%Y-%m-%d")
 		print(f"Última atualização: {date_str}")
 		return date_str

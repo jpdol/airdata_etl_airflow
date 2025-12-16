@@ -1,7 +1,7 @@
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.sdk import dag, task
 from datetime import date, timedelta
-
+from airflow.models import Variable
 
 def make_request(reference_date: date = date.today()):
     """
@@ -274,12 +274,18 @@ def microdados_basicos_extraction():
 
         print(f'{"=" * 60}\n')
 
+    # Pega a variável global
+    initial_date_str = Variable.get('initial-date')
+    ano, mes, dia = initial_date_str.split('-')
+    start_date = date(day=dia, month=mes, year=ano)
+    end_date = date.today()
+
     # Define a sequência de execução
     # Por padrão, busca dados do dia anterior (D-1)
     # Para carregar um intervalo de datas, especifique start_date e end_date
     insert_data = insert_microdados_data(
-        start_date=date(day=1, month=1, year=2025),
-        end_date=date(day=3, month=1, year=2025)
+        start_date=start_date,
+        end_date=end_date)
     )
 
     create_table >> insert_data
