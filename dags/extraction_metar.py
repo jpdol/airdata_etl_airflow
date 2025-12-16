@@ -1,7 +1,7 @@
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.sdk import dag, task
 from datetime import date
-
+from airflow.models import Variable
 
 def make_request(
         stations: list = None,
@@ -195,9 +195,16 @@ def metar_extraction():
         )
         print('Inserção de dados finalizada')
 
+
+    # Pega a variável global
+    initial_date_str = Variable.get('initial-date')
+    ano, mes, dia = initial_date_str.split('-')
+    start_date = date(day=dia, month=mes, year=ano)
+    end_date = date.today()
+
     insert_data = insert_metar_data(
-        start_date=date(day=1, month=1, year=2025),
-        end_date=date(day=31, month=1, year=2025),
+        start_date=start_date,
+        end_date=end_date,
     )
     create_table >> insert_data
 
