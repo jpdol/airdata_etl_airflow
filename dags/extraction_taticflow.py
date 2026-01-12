@@ -58,7 +58,7 @@ def taticflow_extraction():
         if last_date is None:
             print("Nenhum dado encontrado — iniciando de 2025-07-31")
             initial_date_str = Variable.get('initial_date')
-			return initial_date_str
+            return initial_date_str
 
         return last_date.isoformat(timespec="milliseconds")
 
