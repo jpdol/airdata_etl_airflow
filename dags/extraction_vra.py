@@ -76,8 +76,8 @@ def vra_extraction():
 
         if last_date is None:
             print("Nenhum dado encontrado — iniciando de 2025-07-31")
-            return initial_date_str = Variable.get('initial_date')
-
+            initial_date_str = Variable.get('initial_date')
+			return initial_date_str
 
         date_str = last_date.strftime("%Y-%m-%d")
         print(f"Última atualização: {date_str}")
