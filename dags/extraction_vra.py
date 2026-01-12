@@ -1,6 +1,7 @@
 from airflow.sdk import dag, task
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.models import Variable
 
 
 def _ts_to_py_or_none(v):
@@ -75,7 +76,8 @@ def vra_extraction():
 
         if last_date is None:
             print("Nenhum dado encontrado — iniciando de 2025-07-31")
-            return "2025-07-31"
+            return initial_date_str = Variable.get('initial_date')
+
 
         date_str = last_date.strftime("%Y-%m-%d")
         print(f"Última atualização: {date_str}")
