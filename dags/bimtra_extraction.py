@@ -65,7 +65,7 @@ def bimtra_extraction():
         velocidade varchar(5) NULL,
         pista varchar(5) NULL,
         tgl int4 NULL,
-        codlote varchar(9) NULL
+        codlote varchar(9) NULL,
         dt_insercao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """,
