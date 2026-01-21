@@ -163,4 +163,4 @@ def bimtra_extraction():
     create_table >> last_update >> update_task
 
 
-bimtra_extraction_extraction()
+bimtra_extraction()
