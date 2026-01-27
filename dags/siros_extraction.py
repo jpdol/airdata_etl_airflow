@@ -1,114 +1,174 @@
 from airflow.sdk import dag, task
 from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-import io
+import os
 import zipfile
-import requests
-import pandas as pd
-from psycopg2.extras import execute_values
-from psycopg2 import sql
+from datetime import datetime
 
-@dag(
-    dag_id="siros_extraction",
-    schedule="0 * * * *",  # Uma vez por hora
-    max_active_runs=1,
-    catchup=False
-)
+
+@dag(dag_id="siros_extraction", schedule="0 * * * *", max_active_runs=1)
 def siros_extraction():
-    """DAG para extração dos dados do SIROS (ANAC) via arquivo ZIP"""
+    """DAG para extração e atualização dos dados do SIROS (Sistema de Informações de Registros de Operações de Serviço)"""
 
-    POSTGRES_CONN_ID = "postgres"
-    URL_ZIP = "https://siros.anac.gov.br/SIROS/registros/voos/voos.zip"
+    POSTGRES_CONN_ID = "postgres"  # mesma Connection usada no Airflow
 
-    # 1. Apaga a tabela caso exista e cria uma nova
-    # Como você quer "apagar e subir os dados", o DROP garante que a tabela esteja limpa
-    recreate_table = SQLExecuteQueryOperator(
-        task_id="recreate_table",
+    # Task para dropar e criar a tabela novamente
+    create_table = SQLExecuteQueryOperator(
+        task_id="create_table",
         conn_id=POSTGRES_CONN_ID,
         sql="""
         DROP TABLE IF EXISTS airdata.siros;
         CREATE TABLE airdata.siros (
-            data_referencia_utc timestamp,
-            sigla_icao_empresa_aerea varchar(10),
-            nome_empresa_aerea varchar(255),
-            numero_etapa int,
-            numero_voo varchar(20),
-            sigla_icao_modelo_aeronave varchar(10),
-            quantidade_assentos_previstos int,
-            sigla_icao_aeroporto_origem varchar(10),
-            data_partida_prevista_utc timestamp,
-            sigla_icao_aeroporto_destino varchar(10),
-            data_chegada_prevista_utc timestamp,
-            tipo_de_voo varchar(255),
+            data_referencia_utc TIMESTAMP,
+            sigla_icao_empresa_aerea VARCHAR(10),
+            nome_empresa_aerea VARCHAR(100),
+            numero_etapa INTEGER,
+            numero_voo VARCHAR(10),
+            sigla_icao_modelo_aeronave VARCHAR(10),
+            quantidade_assentos_previstos INTEGER,
+            sigla_icao_aeroporto_origem VARCHAR(10),
+            data_partida_prevista_utc TIMESTAMP,
+            sigla_icao_aeroporto_destino VARCHAR(10),
+            data_chegada_prevista_utc TIMESTAMP,
+            tipo_de_voo VARCHAR(50),
             dt_insercao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """,
     )
 
     @task
-    def process_and_upload_siros():
-        """Baixa o ZIP, extrai em memória e sobe para o Postgres."""
-        
-        print(f"[SIROS] Baixando arquivo de {URL_ZIP}")
+    def download_siros_zip():
+        """Faz o download do arquivo ZIP do SIROS"""
+        # Import inside the task to handle dependencies in Airflow environment
+        import requests
+
+        URL_ZIP = "https://siros.anac.gov.br/SIROS/registros/voos/voos.zip"
+
+        # Define o diretório temporário para armazenamento
+        temp_dir = "/tmp/siros_data"
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # Caminho completo para o arquivo ZIP
+        zip_path = os.path.join(temp_dir, "voos.zip")
+
+        print(f"[SIROS] Baixando arquivo ZIP de {URL_ZIP}")
         response = requests.get(URL_ZIP, timeout=300)
-        if response.status_code != 200:
-            raise Exception(f"Erro ao baixar arquivo: {response.status_code}")
 
-        # Lendo o ZIP em memória para não deixar rastro em disco
-        with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-            # Pega o primeiro arquivo dentro do ZIP
-            filename = z.namelist()[0]
-            with z.open(filename) as f:
-                # Lendo CSV com separador ; e encoding latin1 (comum na ANAC)
-                df = pd.read_csv(f, sep=';', encoding='latin1')
+        if response.status_code == 200:
+            with open(zip_path, 'wb') as f:
+                f.write(response.content)
+            print(f"[SIROS] Arquivo ZIP baixado com sucesso: {zip_path}")
+            return zip_path
+        else:
+            raise Exception(f"[SIROS] Falha ao baixar o arquivo ZIP. Status code: {response.status_code}")
 
-        # Ajuste de nomes de colunas para o banco (remover espaços e acentos se necessário)
-        # Mapeando conforme a ordem do seu exemplo
-        df.columns = [
-            'data_referencia_utc', 'sigla_icao_empresa_aerea', 'nome_empresa_aerea',
-            'numero_etapa', 'numero_voo', 'sigla_icao_modelo_aeronave',
-            'quantidade_assentos_previstos', 'sigla_icao_aeroporto_origem',
-            'data_partida_prevista_utc', 'sigla_icao_aeroporto_destino',
-            'data_chegada_prevista_utc', 'tipo_de_voo'
-        ]
 
-        # Converter colunas de data (ajuste o formato se necessário)
-        date_cols = [
-            'data_referencia_utc', 
-            'data_partida_prevista_utc', 
-            'data_chegada_prevista_utc'
-        ]
-        for col in date_cols:
-            df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
+    @task
+    def extract_csv_from_zip(zip_path: str):
+        """Extrai o arquivo CSV do ZIP e retorna o caminho do CSV"""
+        temp_dir = "/tmp/siros_data"
+        csv_filename = "voos.csv"
+        csv_path = os.path.join(temp_dir, csv_filename)
 
-        # Tratar nulos para o Postgres
-        df = df.where(pd.notnull(df), None)
+        print(f"[SIROS] Extraindo CSV de {zip_path}")
+
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            # Extrai o arquivo CSV
+            zip_ref.extract(csv_filename, temp_dir)
+
+        print(f"[SIROS] Arquivo CSV extraído com sucesso: {csv_path}")
+        return csv_path
+
+
+    @task
+    def load_csv_to_postgres(csv_path: str):
+        """Carrega o arquivo CSV para o PostgreSQL"""
+        # Import inside the task to handle dependencies in Airflow environment
+        import pandas as pd
 
         hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+
+        print(f"[SIROS] Lendo arquivo CSV: {csv_path}")
+
+        # Lê o CSV, pulando a primeira linha (header)
+        df = pd.read_csv(csv_path, sep=';', skiprows=1, encoding='utf-8')
+
+        # Converte colunas de data para datetime
+        date_columns = [
+            'Data Referência UTC',
+            'Data Partida Prevista UTC',
+            'Data Chegada Prevista UTC'
+        ]
+
+        for col in date_columns:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], format='%d/%m/%Y %H:%M:%S', errors='coerce')
+
+        # Renomeia as colunas para seguir convenções do banco de dados
+        column_mapping = {
+            'Data Referência UTC': 'data_referencia_utc',
+            'Sigla ICAO Empresa Aérea': 'sigla_icao_empresa_aerea',
+            'Nome da Empresa Aérea': 'nome_empresa_aerea',
+            'Número Etapa': 'numero_etapa',
+            'Número Voo': 'numero_voo',
+            'Sigla ICAO Modelo Aeronave': 'sigla_icao_modelo_aeronave',
+            'Quantidade de Assentos Previstos': 'quantidade_assentos_previstos',
+            'Sigla ICAO Aeroporto Origem': 'sigla_icao_aeroporto_origem',
+            'Data Partida Prevista UTC': 'data_partida_prevista_utc',
+            'Sigla ICAO Aeroporto Destino': 'sigla_icao_aeroporto_destino',
+            'Data Chegada Prevista UTC': 'data_chegada_prevista_utc',
+            'Tipo de Voo': 'tipo_de_voo'
+        }
+
+        df = df.rename(columns=column_mapping)
+
+        # Conecta ao banco e insere os dados
         conn = hook.get_conn()
-        
         try:
             with conn.cursor() as cur:
-                cols = list(df.columns)
-                values = [tuple(row) for row in df.to_numpy()]
+                # Prepara os dados para inserção
+                for index, row in df.iterrows():
+                    # Converte valores None para NULL no SQL
+                    values = []
+                    for val in row:
+                        if pd.isna(val):
+                            values.append(None)
+                        elif isinstance(val, pd.Timestamp):
+                            values.append(val.strftime('%Y-%m-%d %H:%M:%S'))
+                        else:
+                            values.append(val)
 
-                insert_stmt = sql.SQL("""
-                    INSERT INTO {schema}.{table} ({fields})
-                    VALUES %s
-                """).format(
-                    schema=sql.Identifier("airdata"),
-                    table=sql.Identifier("siros"),
-                    fields=sql.SQL(", ").join(sql.Identifier(c) for c in cols),
-                )
+                    # Monta a query de inserção
+                    insert_query = """
+                        INSERT INTO airdata.siros (
+                            data_referencia_utc,
+                            sigla_icao_empresa_aerea,
+                            nome_empresa_aerea,
+                            numero_etapa,
+                            numero_voo,
+                            sigla_icao_modelo_aeronave,
+                            quantidade_assentos_previstos,
+                            sigla_icao_aeroporto_origem,
+                            data_partida_prevista_utc,
+                            sigla_icao_aeroporto_destino,
+                            data_chegada_prevista_utc,
+                            tipo_de_voo
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    cur.execute(insert_query, tuple(values))
 
-                print(f"[SIROS] Inserindo {len(df)} registros...")
-                execute_values(cur, insert_stmt.as_string(conn), values, page_size=2000)
                 conn.commit()
-                print("[SIROS] Upload concluído com sucesso.")
+                print(f"[SIROS] Dados carregados com sucesso. Total de registros: {len(df)}")
         finally:
             conn.close()
 
-    # Fluxo: Primeiro recria a tabela, depois processa os dados
-    recreate_table >> process_and_upload_siros()
+
+    # Orquestração das tasks
+    downloaded_zip = download_siros_zip()
+    extracted_csv = extract_csv_from_zip(downloaded_zip)
+    load_task = load_csv_to_postgres(extracted_csv)
+
+    create_table >> downloaded_zip >> extracted_csv >> load_task
+
 
 siros_extraction()
