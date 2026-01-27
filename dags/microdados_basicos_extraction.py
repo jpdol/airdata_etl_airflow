@@ -1,7 +1,9 @@
-from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from airflow.sdk import dag, task
-from datetime import date, timedelta
+from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.models import Variable
+from datetime import date, timedelta
+
 
 def make_request(reference_date: date = date.today()):
     """
@@ -32,17 +34,22 @@ def make_request(reference_date: date = date.today()):
 
     if response.status_code == 200:
         try:
-            # Parse do JSON
+            # Parse do JSON - REMOVIDO O JSON.DUMPS DUPLICADO
             text = response.content.decode('utf-8').strip('\ufeff').strip()
+
+            # Verifica se a resposta é uma string que precisa ser parseada novamente
+            if text.startswith('"') and text.endswith('"'):
+                # Pode ser um JSON escapado como string
+                text = json.loads(text)
+
             data = json.loads(text)
-            data = json.loads(data)
 
             if not data or data == 'Nenhum dado foi encontrado.':
                 print('Nenhum dado retornado pela API')
                 return None
 
             print(f'{type(data)=}')
-            print(f'{data=}'[:100])
+            print(f'Total de registros obtidos: {len(data)}')
 
             # Converte para DataFrame
             dataframe = DataFrame(data)
@@ -52,6 +59,7 @@ def make_request(reference_date: date = date.today()):
 
         except json.JSONDecodeError as e:
             print(f'Erro ao decodificar JSON: {e}')
+            print(f'Texto recebido: {text[:500]}...')  # Mostra parte do texto para debug
             return None
     else:
         print(f'Erro na requisição: {response.status_code}')
@@ -64,11 +72,13 @@ def microdados_basicos_extraction():
     DAG para extração dos microdados básicos da ANAC
     Executa diariamente às 7h UTC
     """
+    
+    POSTGRES_CONN_ID = "postgres"  # mesma Connection usada no Airflow
 
     # Task para criar a tabela se não existir
     create_table = SQLExecuteQueryOperator(
         task_id='create_table',
-        conn_id='postgres',
+        conn_id=POSTGRES_CONN_ID,
         sql="""
         CREATE TABLE IF NOT EXISTS airdata.microdados_basicos (
             sg_empresa_icao TEXT,              -- código ICAO da empresa
@@ -113,70 +123,69 @@ def microdados_basicos_extraction():
             nr_ask REAL,                       -- ASK (Available Seat Kilometers)
             nr_rpk REAL,                       -- RPK (Revenue Passenger Kilometers)
             nr_atk REAL,                       -- ATK (Available Tonne Kilometers)
-            nr_rtk REAL                        -- RTK (Revenue Tonne Kilometers)
+            nr_rtk REAL,                       -- RTK (Revenue Tonne Kilometers)
+            dt_insercao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
         -- Criar índices para melhorar performance de queries
-        CREATE INDEX IF NOT EXISTS idx_microdados_dt_referencia 
+        CREATE INDEX IF NOT EXISTS idx_microdados_dt_referencia
             ON airdata.microdados_basicos(dt_referencia);
-        CREATE INDEX IF NOT EXISTS idx_microdados_empresa 
+        CREATE INDEX IF NOT EXISTS idx_microdados_empresa
             ON airdata.microdados_basicos(sg_empresa_icao);
-        CREATE INDEX IF NOT EXISTS idx_microdados_origem 
+        CREATE INDEX IF NOT EXISTS idx_microdados_origem
             ON airdata.microdados_basicos(sg_icao_origem);
-        CREATE INDEX IF NOT EXISTS idx_microdados_destino 
+        CREATE INDEX IF NOT EXISTS idx_microdados_destino
             ON airdata.microdados_basicos(sg_icao_destino);
         """
     )
 
     @task
-    def insert_microdados_data(start_date: date = None, end_date: date = None):
+    def get_last_update() -> str:
+        """Obtém a última data registrada na tabela airdata.microdados_basicos usando a conexão do Airflow."""
+        hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        row = hook.get_first("SELECT MAX(dt_referencia) FROM airdata.microdados_basicos;")
+        last_date = row[0] if row else None
+
+        if last_date is None:
+            print("Nenhum dado encontrado — iniciando da data inicial definida no Airflow")
+            initial_date_str = Variable.get('initial_date')
+            return initial_date_str
+
+        return last_date.isoformat()  # Retorna no formato YYYY-MM-DD
+
+    @task
+    def update_microdados_data(last_date_str: str):
         """
-        Insere os dados dos microdados básicos em um intervalo de datas.
-
-        Args:
-            start_date: Data inicial do intervalo. Se None, usa o dia anterior (D-1)
-            end_date: Data final do intervalo. Se None, usa a mesma data que start_date
+        Atualiza dados dos microdados básicos a partir da última data registrada, sem SQLAlchemy (robusto).
         """
-        from sqlalchemy import create_engine
-        import configparser
-        from pandas import concat
+        import pandas as pd
+        from psycopg2.extras import execute_values
+        from psycopg2 import sql
+        from datetime import datetime, date
 
-        # Se não informada, usa o dia anterior
-        if start_date is None:
-            start_date = date.today() - timedelta(days=1)
+        # Converter a string de volta para objeto date
+        try:
+            # Tenta converter do formato YYYY-MM-DD
+            last_date = datetime.strptime(last_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            # Se falhar, usa a data inicial
+            initial_date_str = Variable.get('initial_date')
+            last_date = datetime.strptime(initial_date_str, '%Y-%m-%d').date()
 
-        # Se end_date não informada, usa a mesma que start_date
-        if end_date is None:
-            end_date = start_date
+        # Ajustar para começar do dia seguinte
+        start_date = last_date + timedelta(days=1)
+        end_date = date.today()
 
-        # Valida que end_date >= start_date
-        if end_date < start_date:
-            print(f'Erro: Data final ({end_date}) é anterior à data inicial ({start_date})')
+        print(f'Data de início: {start_date.strftime("%d/%m/%Y")}')
+        print(f'Data de fim: {end_date.strftime("%d/%m/%Y")}')
+
+        # Verificar se há dados para buscar
+        if start_date > end_date:
+            print("Não há novos dados para buscar - a data inicial é posterior à data final")
             return
 
-        print(f'Período: {start_date.strftime("%d/%m/%Y")} até {end_date.strftime("%d/%m/%Y")}')
-
-        # Calcula número de dias no intervalo
-        num_days = (end_date - start_date).days + 1
-        print(f'Total de dias a processar: {num_days}')
-
-        # Leitura das configurações do banco de dados
-        config = configparser.ConfigParser()
-        config.read("/opt/airflow/config/db.cfg")
-        DB_CONFIG = {
-            "host": config["database"]["host"],
-            "port": config["database"]["port"],
-            "dbname": config["database"]["dbname"],
-            "user": config["database"]["user"],
-            "password": config["database"]["password"],
-        }
-
-        # Criação da engine de conexão com o banco de dados
-        engine = create_engine(
-            f"postgresql+psycopg2://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
-            f"{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}"
-        )
-
+        hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+        
         # Itera sobre cada dia no intervalo
         current_date = start_date
         total_records = 0
@@ -185,7 +194,7 @@ def microdados_basicos_extraction():
 
         while current_date <= end_date:
             print(f'\n{"=" * 60}')
-            print(f'Processando data: {current_date.strftime("%d/%m/%Y")} ({success_count + 1}/{num_days})')
+            print(f'Processando data: {current_date.strftime("%d/%m/%Y")} ({success_count + 1}/{(end_date - start_date).days + 1})')
             print(f'{"=" * 60}')
 
             try:
@@ -202,26 +211,24 @@ def microdados_basicos_extraction():
 
                 # Tratamento de campos de data e hora
                 # Converte strings de data no formato DD/MM/YYYY para datetime
+                def convert_date(date_str):
+                    if pd.isna(date_str) or date_str is None:
+                        return None
+                    try:
+                        # Tenta converter do formato DD/MM/YYYY
+                        day, month, year = date_str.split('/')
+                        return date(int(year), int(month), int(day))
+                    except (ValueError, AttributeError):
+                        return None
+
                 if 'dt_referencia' in data.columns:
-                    data['dt_referencia'] = data['dt_referencia'].apply(
-                        lambda x: date.fromisoformat(
-                            x.split('/')[::-1].__str__().replace("['", "").replace("', '", "-").replace("']",
-                                                                                                        "")) if x else None
-                    )
+                    data['dt_referencia'] = data['dt_referencia'].apply(convert_date)
 
                 if 'dt_partida_real' in data.columns:
-                    data['dt_partida_real'] = data['dt_partida_real'].apply(
-                        lambda x: date.fromisoformat(
-                            x.split('/')[::-1].__str__().replace("['", "").replace("', '", "-").replace("']",
-                                                                                                        "")) if x else None
-                    )
+                    data['dt_partida_real'] = data['dt_partida_real'].apply(convert_date)
 
                 if 'dt_chegada_real' in data.columns:
-                    data['dt_chegada_real'] = data['dt_chegada_real'].apply(
-                        lambda x: date.fromisoformat(
-                            x.split('/')[::-1].__str__().replace("['", "").replace("', '", "-").replace("']",
-                                                                                                        "")) if x else None
-                    )
+                    data['dt_chegada_real'] = data['dt_chegada_real'].apply(convert_date)
 
                 # Converte campos numéricos
                 numeric_columns = [
@@ -234,19 +241,46 @@ def microdados_basicos_extraction():
                 for col in numeric_columns:
                     if col in data.columns:
                         data[col] = data[col].replace('', None)
-                        data[col] = data[col].apply(lambda x: float(x) if x and str(x) != '0' else None)
+                        # Correção: mantém os valores zero e converte apenas strings válidas para números
+                        def convert_numeric(value):
+                            if pd.isna(value) or value is None:
+                                return None
+                            try:
+                                val_str = str(value).strip()
+                                if val_str == '' or val_str.lower() == 'null':
+                                    return None
+                                return float(val_str)
+                            except (ValueError, TypeError):
+                                return None
 
-                print(f'Inserindo {len(data)} registros na tabela airdata.microdados_basicos')
-                data.to_sql(
-                    "microdados_basicos",
-                    con=engine,
-                    schema="airdata",
-                    if_exists="append",
-                    index=False,
-                    chunksize=1000,
-                    method="multi"
-                )
-                print(f'✓ Inserção concluída para {current_date.strftime("%d/%m/%Y")}')
+                        data[col] = data[col].apply(convert_numeric)
+
+                # NaN -> None (para virar NULL no Postgres)
+                data = data.where(pd.notnull(data), None)
+
+                conn = hook.get_conn()  # conexão psycopg2 do Airflow
+                try:
+                    with conn.cursor() as cur:
+                        cols = list(data.columns)
+                        values = [tuple(row) for row in data.to_numpy()]
+
+                        insert_stmt = sql.SQL("""
+                            INSERT INTO {schema}.{table} ({fields})
+                            VALUES %s
+                        """).format(
+                            schema=sql.Identifier("airdata"),
+                            table=sql.Identifier("microdados_basicos"),
+                            fields=sql.SQL(", ").join(sql.Identifier(c) for c in cols),
+                        )
+
+                        # Bulk insert rápido
+                        execute_values(cur, insert_stmt.as_string(conn), values, page_size=1000)
+                        conn.commit()
+
+                        print(f"[MICRODADOS_BASICOS] Inseridos {len(data)} registros para {current_date.strftime('%d/%m/%Y')}.")
+
+                finally:
+                    conn.close()
 
                 total_records += len(data)
                 success_count += 1
@@ -262,7 +296,7 @@ def microdados_basicos_extraction():
         print(f'\n{"=" * 60}')
         print('RESUMO DA EXECUÇÃO')
         print(f'{"=" * 60}')
-        print(f'Total de dias processados: {success_count}/{num_days}')
+        print(f'Total de dias processados: {success_count}/{(end_date - start_date).days + 1}')
         print(f'Total de registros inseridos: {total_records}')
 
         if failed_dates:
@@ -274,35 +308,11 @@ def microdados_basicos_extraction():
 
         print(f'{"=" * 60}\n')
 
-    # Pega a variável global
-    initial_date_str = Variable.get('initial_date')
-    ano, mes, dia = initial_date_str.split('-')
-    start_date = date(day=dia, month=mes, year=ano)
-    end_date = date.today()
+    last_update = get_last_update()
+    update_task = update_microdados_data(last_update)
 
-    # Define a sequência de execução
-    # Por padrão, busca dados do dia anterior (D-1)
-    # Para carregar um intervalo de datas, especifique start_date e end_date
-    insert_data = insert_microdados_data(
-        start_date=start_date,
-        end_date=end_date)
-    )
-
-    create_table >> insert_data
+    create_table >> last_update >> update_task
 
 
 # Instancia a DAG
 microdados_basicos_extraction()
-
-# Código para teste local (comentado)
-# if __name__ == '__main__':
-#     from datetime import date
-#
-#     # Testa com uma data específica
-#     test_date = date(day=10, month=11, year=2025)
-#     df = make_request(reference_date=test_date)
-#
-#     if df is not None:
-#         print(f'\nTotal de registros: {len(df)}')
-#         print(f'\nColunas: {df.columns.tolist()}')
-#         print(f'\nPrimeiras linhas:\n{df.head()}')
